@@ -177,8 +177,7 @@ __constant__ uint32_t d_RK[64];            // MD5_K[i] + 定数メッセージ�
 // LEN>=8 は 61 段後の B が最終 A と同じであることを使い、末尾3段を省略する。
 template <int LEN>
 __device__ __forceinline__ bool md5_candidate(
-    const uint32_t pwWords[5], uint32_t earlyA,
-    uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td)
+    const uint32_t pwWords[5], uint32_t earlyA, uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td)
 {
     enum
     {
@@ -274,9 +273,7 @@ __device__ __forceinline__ bool md5_candidate(
 // LEN はパスワード長(コンパイル時定数)。1スレッドが batch 個の候補を連続処理する。
 template <int LEN>
 __global__ void __launch_bounds__(TPB) crack(
-    uint64_t offset, uint64_t count, int batch, int clen,
-    uint32_t earlyA, uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td,
-    int *found, unsigned char *result)
+    uint64_t offset, uint64_t count, int batch, int clen, uint32_t earlyA, uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td, int *found, unsigned char *result)
 {
     // 文字集合を共有メモリへ (ダイバージェント参照の直列化を回避)
     __shared__ unsigned char s_charset[128];
@@ -352,9 +349,7 @@ __global__ void __launch_bounds__(TPB) crack(
 }
 
 // ---- ディスパッチ(長さ→特殊化カーネル) --------------------------------------
-static void launch(int len, unsigned int blocks, uint64_t off, uint64_t count, int batch, int clen,
-                   uint32_t earlyA, uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td,
-                   int *d_found, unsigned char *d_result)
+static void launch(int len, unsigned int blocks, uint64_t off, uint64_t count, int batch, int clen, uint32_t earlyA, uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td, int *d_found, unsigned char *d_result)
 {
 #define LAUNCH(L)                                                                                      \
     case L:                                                                                            \
@@ -515,8 +510,7 @@ static bool expandRegexCharset(const std::string &in, std::string &out)
 
 // 最終内部状態から、パスワード語がもう現れないラウンドを逆に戻す。
 // 戻り値はカーネルの早期判定に使う A レジスタ。
-static uint32_t reverse_early_a(int len, const uint32_t M[16],
-                                uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td)
+static uint32_t reverse_early_a(int len, const uint32_t M[16], uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td)
 {
     const int steps = (len <= 3) ? 49 : 56;
     uint32_t A = ta, B = tb, C = tc, D = td;
@@ -795,8 +789,7 @@ int main(int argc, char **argv)
     }
     const int numDev = (int)devices.size();
 
-    printf("charset size = %d, length %d..%d, id=%d, challenge=%d bytes, batch=%d\n",
-           clen, minLen, maxLen, id, chlen, batch);
+    printf("charset size = %d, length %d..%d, id=%d, challenge=%d bytes, batch=%d\n", clen, minLen, maxLen, id, chlen, batch);
     printf("charset = \"%s\"\n", charset.c_str());
     printf("using %d GPU(s):", numDev);
     for (int d : devices)
@@ -889,8 +882,7 @@ int main(int argc, char **argv)
                     uint64_t threads = (count + (uint64_t)batch - 1) / (uint64_t)batch;
                     uint64_t blocks = (threads + TPB - 1) / TPB;
 
-                    launch(len, (unsigned int)blocks, off, count, batch, clen,
-                           earlyA, ta, tb, tc, td, d_found, d_result);
+                    launch(len, (unsigned int)blocks, off, count, batch, clen, earlyA, ta, tb, tc, td, d_found, d_result);
                     CUDA_CHECK(cudaGetLastError());
                     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -902,8 +894,7 @@ int main(int argc, char **argv)
                     {
                         // 最初の発見者だけが結果を確定させる
                         if (g_found.exchange(1) == 0)
-                            CUDA_CHECK(cudaMemcpy(result, d_result, MAX_PW_LEN + 1,
-                                                  cudaMemcpyDeviceToHost));
+                            CUDA_CHECK(cudaMemcpy(result, d_result, MAX_PW_LEN + 1, cudaMemcpyDeviceToHost));
                         break;
                     }
 
@@ -936,8 +927,7 @@ int main(int argc, char **argv)
         printf("[FOUND] password = \"%s\"\n", result);
     else
         printf("[NOT FOUND] in given keyspace\n");
-    printf("tried %.4e candidates in %.2f s (%.1f Mh/s)\n",
-           (double)tried, sec, sec > 0 ? tried / sec / 1e6 : 0);
+    printf("tried %.4e candidates in %.2f s (%.1f Mh/s)\n", (double)tried, sec, sec > 0 ? tried / sec / 1e6 : 0);
 
     return 0;
 }
