@@ -24,11 +24,11 @@ windows:  nvcc -O3 -arch=native -Xcompiler /utf-8 sip_digest_bulldozer.cu -o sip
 Linux:    nvcc -O3 -arch=native sip_digest_bulldozer.cu -o sip_digest_bulldozer
 (-arch=native は実行ホストの GPU 世代を自動選択。/utf-8 は日本語コメントを MSVC が CP932 誤読するのを防ぐため必須)
 
-実行例(voip.pcapng の REGISTER をクラック):
-./sip_digest_bulldozer --username GNK14KB849 --realm ims.eonet.ne.jp \
-    --method REGISTER --uri sip:10.255.232.181 \
-    --nonce 727249E3B472796A00000000F8916B78 --qop auth --nc 00000001 --cnonce 7e8b6147 \
-    --response e3f39edcdc5ce6a3f775bc15a85e69f2 \
+実行例(キャプチャした REGISTER をクラック。各値は自分のキャプチャから読み取る):
+./sip_digest_bulldozer --username alice --realm sip.example.com \
+    --method REGISTER --uri sip:192.0.2.1 \
+    --nonce 00000000000000000000000000000000 --qop auth --nc 00000001 --cnonce 00000000 \
+    --response 00000000000000000000000000000000 \
     --charset "abcdefghijklmnopqrstuvwxyz0123456789" --min 1 --max 8
 
 特定パスワードの検算(GPU不要):

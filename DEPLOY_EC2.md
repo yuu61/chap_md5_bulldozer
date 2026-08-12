@@ -116,7 +116,7 @@ CH=abcd1234ef567890
 TG=abcd1234ef567890
 
 # ① 検算（GPU不要）: --test は --target 不要、--id/--challenge は必須
-./chap_md5_bulldozer --id $ID --challenge $CH --test PPPe0Tel@OLS
+./chap_md5_bulldozer --id $ID --challenge $CH --test testpassword
 
 # ② 既定の探索（a-z0-9, 長さ1〜8）
 ./chap_md5_bulldozer --id $ID --challenge $CH --target $TG
