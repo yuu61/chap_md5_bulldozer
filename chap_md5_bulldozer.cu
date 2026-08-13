@@ -321,29 +321,46 @@ __global__ void __launch_bounds__(TPB) crack(
             return;
         }
 
-        // オドメーター +1 (アンロール; 桁上がりは述語化されるため分岐発散が小さい)
-        bool carry = true;
-#pragma unroll
-        for (int p = LEN - 1; p >= 0; p--)
+        // オドメーター +1。大半の候補では最下位桁だけが変わるため、桁上がり時だけ上位桁へ進む。
+        int d = dig[LEN - 1] + 1;
+        if (d < clen)
         {
-            if (carry)
+            dig[LEN - 1] = d;
+            const int o = 1 + (LEN - 1);
+            const uint32_t shift = (o & 3) * 8;
+            const uint32_t mask = 0xffu << shift;
+            pwWords[o >> 2] = (pwWords[o >> 2] & ~mask) |
+                              ((uint32_t)s_charset[d] << shift);
+            continue;
+        }
+        dig[LEN - 1] = 0;
+        {
+            const int o = 1 + (LEN - 1);
+            const uint32_t shift = (o & 3) * 8;
+            const uint32_t mask = 0xffu << shift;
+            pwWords[o >> 2] = (pwWords[o >> 2] & ~mask) |
+                              ((uint32_t)s_charset[0] << shift);
+        }
+#pragma unroll
+        for (int p = LEN - 2; p >= 0; p--)
+        {
+            d = dig[p] + 1;
+            if (d < clen)
             {
-                int d = dig[p] + 1;
-                if (d < clen)
-                {
-                    carry = false;
-                }
-                else
-                {
-                    d = 0;
-                }
                 dig[p] = d;
                 const int o = 1 + p;
                 const uint32_t shift = (o & 3) * 8;
                 const uint32_t mask = 0xffu << shift;
                 pwWords[o >> 2] = (pwWords[o >> 2] & ~mask) |
                                   ((uint32_t)s_charset[d] << shift);
+                break;
             }
+            dig[p] = 0;
+            const int o = 1 + p;
+            const uint32_t shift = (o & 3) * 8;
+            const uint32_t mask = 0xffu << shift;
+            pwWords[o >> 2] = (pwWords[o >> 2] & ~mask) |
+                              ((uint32_t)s_charset[0] << shift);
         }
     }
 }

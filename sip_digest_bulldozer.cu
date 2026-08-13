@@ -77,6 +77,27 @@ __host__ __device__ __forceinline__ uint32_t rotl32(uint32_t x, int c)
     return (x << c) | (x >> (32 - c));
 }
 
+static const uint32_t HOST_MD5_K[64] = {
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
+
+static inline int md5_word_index(int i)
+{
+    if (i < 16)
+        return i;
+    if (i < 32)
+        return (5 * i + 1) & 15;
+    if (i < 48)
+        return (3 * i + 5) & 15;
+    return (7 * i) & 15;
+}
+
 // state(st) を初期値または前ブロックの結果とし、M(16語)で1ブロック分の圧縮を行い加算する。
 // ループは #pragma unroll で完全展開され、g(語添字)がコンパイル時定数になるため
 // M[16] がレジスタに載る(呼び出し側はレジスタ配列を渡すこと)。
@@ -180,27 +201,237 @@ static std::string md5_hex(const std::string &s)
 
 // ---- 定数メモリ --------------------------------------------------------------
 __constant__ unsigned char d_charset[128];             // 文字集合
-__constant__ uint32_t d_ha1_base[16];                  // HA1 メッセージ語(password 領域=0, pad/bitlen 込み・単一ブロック)
+__constant__ uint32_t d_ha1_RK[64];                    // MD5_K[i] + HA1 固定メッセージ語
 __constant__ int d_pw_word[MAX_PW_LEN];                // password 文字 i → HA1 メッセージの語添字
 __constant__ int d_pw_shift[MAX_PW_LEN];               // password 文字 i → その語内シフト量
-__constant__ uint32_t d_resp_words[MAX_RESP_BLK * 16]; // response メッセージ語(先頭32B=HA1hex 領域=0, pad/bitlen 込み)
+__constant__ uint32_t d_resp_RK[MAX_RESP_BLK * 64];    // MD5_K[i] + response 固定メッセージ語
 
 // HA1(16バイト) → 32文字の小文字hex → 8語(リトルエンディアン詰め)
+__device__ __forceinline__ uint32_t hex_ascii(uint32_t v)
+{
+    return v + (uint32_t)'0' + (v > 9 ? 39u : 0u);
+}
+
 __device__ __forceinline__ void ha1_to_words(const uint32_t h1[4], uint32_t hx[8])
 {
-    unsigned char hb[32];
-#pragma unroll
-    for (int j = 0; j < 16; j++)
-    {
-        unsigned char v = (h1[j >> 2] >> ((j & 3) * 8)) & 0xff;
-        unsigned char hi = v >> 4, lo = v & 15;
-        hb[j * 2 + 0] = hi < 10 ? ('0' + hi) : ('a' + hi - 10);
-        hb[j * 2 + 1] = lo < 10 ? ('0' + lo) : ('a' + lo - 10);
-    }
 #pragma unroll
     for (int w = 0; w < 8; w++)
-        hx[w] = (uint32_t)hb[w * 4 + 0] | (uint32_t)hb[w * 4 + 1] << 8 |
-                (uint32_t)hb[w * 4 + 2] << 16 | (uint32_t)hb[w * 4 + 3] << 24;
+    {
+        uint32_t v0 = (h1[(w * 2) >> 2] >> (((w * 2) & 3) * 8)) & 0xffu;
+        uint32_t v1 = (h1[(w * 2 + 1) >> 2] >> (((w * 2 + 1) & 3) * 8)) & 0xffu;
+        hx[w] = hex_ascii(v0 >> 4) |
+                (hex_ascii(v0 & 15u) << 8) |
+                (hex_ascii(v1 >> 4) << 16) |
+                (hex_ascii(v1 & 15u) << 24);
+    }
+}
+
+// HA1 は prefix/pad/bitlen を d_ha1_RK に畳み込み、password 由来の語だけを加える。
+__device__ __forceinline__ void md5_block_ha1(const uint32_t pwWords[16], uint32_t out[4])
+{
+    const int s[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+    uint32_t A = 0x67452301, B = 0xefcdab89, C = 0x98badcfe, D = 0x10325476;
+#pragma unroll
+    for (int i = 0; i < 64; i++)
+    {
+        uint32_t f;
+        int g;
+        if (i < 16)
+        {
+            f = (B & C) | (~B & D);
+            g = i;
+        }
+        else if (i < 32)
+        {
+            f = (D & B) | (~D & C);
+            g = (5 * i + 1) & 15;
+        }
+        else if (i < 48)
+        {
+            f = B ^ C ^ D;
+            g = (3 * i + 5) & 15;
+        }
+        else
+        {
+            f = C ^ (B | ~D);
+            g = (7 * i) & 15;
+        }
+        f = f + A + d_ha1_RK[i] + pwWords[g];
+        A = D;
+        D = C;
+        C = B;
+        B = B + rotl32(f, s[i]);
+    }
+    out[0] = 0x67452301 + A;
+    out[1] = 0xefcdab89 + B;
+    out[2] = 0x98badcfe + C;
+    out[3] = 0x10325476 + D;
+}
+
+__device__ __forceinline__ void md5_block_resp0(uint32_t st[4], const uint32_t hx[8])
+{
+    const int s[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+    uint32_t A = st[0], B = st[1], C = st[2], D = st[3];
+#pragma unroll
+    for (int i = 0; i < 64; i++)
+    {
+        uint32_t f;
+        int g;
+        if (i < 16)
+        {
+            f = (B & C) | (~B & D);
+            g = i;
+        }
+        else if (i < 32)
+        {
+            f = (D & B) | (~D & C);
+            g = (5 * i + 1) & 15;
+        }
+        else if (i < 48)
+        {
+            f = B ^ C ^ D;
+            g = (3 * i + 5) & 15;
+        }
+        else
+        {
+            f = C ^ (B | ~D);
+            g = (7 * i) & 15;
+        }
+        f = f + A + d_resp_RK[i];
+        if (g < 8)
+            f += hx[g];
+        A = D;
+        D = C;
+        C = B;
+        B = B + rotl32(f, s[i]);
+    }
+    st[0] += A;
+    st[1] += B;
+    st[2] += C;
+    st[3] += D;
+}
+
+template <int BIDX>
+__device__ __forceinline__ void md5_block_resp_const(uint32_t st[4])
+{
+    const int s[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+    uint32_t A = st[0], B = st[1], C = st[2], D = st[3];
+#pragma unroll
+    for (int i = 0; i < 64; i++)
+    {
+        uint32_t f;
+        if (i < 16)
+        {
+            f = (B & C) | (~B & D);
+        }
+        else if (i < 32)
+        {
+            f = (D & B) | (~D & C);
+        }
+        else if (i < 48)
+        {
+            f = B ^ C ^ D;
+        }
+        else
+        {
+            f = C ^ (B | ~D);
+        }
+        f = f + A + d_resp_RK[BIDX * 64 + i];
+        A = D;
+        D = C;
+        C = B;
+        B = B + rotl32(f, s[i]);
+    }
+    st[0] += A;
+    st[1] += B;
+    st[2] += C;
+    st[3] += D;
+}
+
+template <int BIDX>
+__device__ __forceinline__ bool md5_block_resp_const_match(const uint32_t st[4], uint32_t ta, uint32_t tb, uint32_t tc, uint32_t td)
+{
+    const int s[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+    const uint32_t base0 = st[0], base1 = st[1], base2 = st[2], base3 = st[3];
+    uint32_t A = base0, B = base1, C = base2, D = base3;
+#pragma unroll
+    for (int i = 0; i < 61; i++)
+    {
+        uint32_t f;
+        if (i < 16)
+        {
+            f = (B & C) | (~B & D);
+        }
+        else if (i < 32)
+        {
+            f = (D & B) | (~D & C);
+        }
+        else if (i < 48)
+        {
+            f = B ^ C ^ D;
+        }
+        else
+        {
+            f = C ^ (B | ~D);
+        }
+        f = f + A + d_resp_RK[BIDX * 64 + i];
+        A = D;
+        D = C;
+        C = B;
+        B = B + rotl32(f, s[i]);
+    }
+
+    if (B != ta - base0)
+        return false;
+
+#pragma unroll
+    for (int i = 61; i < 64; i++)
+    {
+        uint32_t f;
+        if (i < 16)
+        {
+            f = (B & C) | (~B & D);
+        }
+        else if (i < 32)
+        {
+            f = (D & B) | (~D & C);
+        }
+        else if (i < 48)
+        {
+            f = B ^ C ^ D;
+        }
+        else
+        {
+            f = C ^ (B | ~D);
+        }
+        f = f + A + d_resp_RK[BIDX * 64 + i];
+        A = D;
+        D = C;
+        C = B;
+        B = B + rotl32(f, s[i]);
+    }
+
+    return base0 + A == ta && base1 + B == tb && base2 + C == tc && base3 + D == td;
 }
 
 // ---- 特殊化カーネル ----------------------------------------------------------
@@ -227,60 +458,44 @@ __global__ void __launch_bounds__(TPB) crack(
 
     // オドメーター初期化: start を base-clen 展開(スレッドあたり1回だけ除算)
     int dig[LEN];
+    uint32_t ha1Pw[16] = {0};
     {
         uint64_t code = start;
 #pragma unroll
         for (int i = LEN - 1; i >= 0; i--)
         {
-            dig[i] = (int)(code % (uint64_t)clen);
+            int d = (int)(code % (uint64_t)clen);
             code /= (uint64_t)clen;
+            dig[i] = d;
+            ha1Pw[d_pw_word[i]] |= (uint32_t)s_charset[d] << d_pw_shift[i];
         }
     }
 
     for (int n = 0; n < work; n++)
     {
         // --- HA1 = MD5(username:realm:password) ---
-        // 固定部(prefix+pad+bitlen)を base からコピーし、password バイトを重ねる。
-        uint32_t M[16];
-#pragma unroll
-        for (int i = 0; i < 16; i++)
-            M[i] = d_ha1_base[i];
-#pragma unroll
-        for (int i = 0; i < LEN; i++)
-            M[d_pw_word[i]] |= (uint32_t)s_charset[dig[i]] << d_pw_shift[i];
-        // 展開後のメッセージ語をレジスタ配列へ移し、圧縮の 64 段をレジスタで回す
-        uint32_t Mr[16];
-#pragma unroll
-        for (int i = 0; i < 16; i++)
-            Mr[i] = M[i];
-        uint32_t h1[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
-        md5_block(h1, Mr);
+        uint32_t h1[4];
+        md5_block_ha1(ha1Pw, h1);
 
         // --- HA1 を hex 化して response メッセージの先頭 8 語へ ---
         uint32_t hx[8];
         ha1_to_words(h1, hx);
 
         // --- response = MD5(HA1hex : nonce : [nc:cnonce:qop:] HA2hex) ---
-        uint32_t R[RBLK * 16];
-#pragma unroll
-        for (int i = 0; i < RBLK * 16; i++)
-            R[i] = d_resp_words[i];
-#pragma unroll
-        for (int i = 0; i < 8; i++)
-            R[i] = hx[i];
-
         uint32_t st2[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
-#pragma unroll
-        for (int b = 0; b < RBLK; b++)
+        md5_block_resp0(st2, hx);
+        bool matched;
+        if (RBLK == 3)
         {
-            uint32_t Mb[16];
-#pragma unroll
-            for (int i = 0; i < 16; i++)
-                Mb[i] = R[b * 16 + i];
-            md5_block(st2, Mb);
+            md5_block_resp_const<1>(st2);
+            matched = md5_block_resp_const_match<2>(st2, ta, tb, tc, td);
+        }
+        else
+        {
+            matched = md5_block_resp_const_match<1>(st2, ta, tb, tc, td);
         }
 
-        if (st2[0] == ta && st2[1] == tb && st2[2] == tc && st2[3] == td)
+        if (matched)
         {
             if (atomicExch(found, 1) == 0)
             {
@@ -293,19 +508,41 @@ __global__ void __launch_bounds__(TPB) crack(
         }
 
         // オドメーター +1
-        bool carry = true;
-#pragma unroll
-        for (int p = LEN - 1; p >= 0; p--)
+        int d = dig[LEN - 1] + 1;
+        if (d < clen)
         {
-            if (carry)
+            dig[LEN - 1] = d;
+            const int w = d_pw_word[LEN - 1];
+            const uint32_t shift = (uint32_t)d_pw_shift[LEN - 1];
+            const uint32_t mask = 0xffu << shift;
+            ha1Pw[w] = (ha1Pw[w] & ~mask) | ((uint32_t)s_charset[d] << shift);
+            continue;
+        }
+        dig[LEN - 1] = 0;
+        {
+            const int w = d_pw_word[LEN - 1];
+            const uint32_t shift = (uint32_t)d_pw_shift[LEN - 1];
+            const uint32_t mask = 0xffu << shift;
+            ha1Pw[w] = (ha1Pw[w] & ~mask) | ((uint32_t)s_charset[0] << shift);
+        }
+#pragma unroll
+        for (int p = LEN - 2; p >= 0; p--)
+        {
+            d = dig[p] + 1;
+            if (d < clen)
             {
-                int d = dig[p] + 1;
-                if (d < clen)
-                    carry = false;
-                else
-                    d = 0;
                 dig[p] = d;
+                const int w = d_pw_word[p];
+                const uint32_t shift = (uint32_t)d_pw_shift[p];
+                const uint32_t mask = 0xffu << shift;
+                ha1Pw[w] = (ha1Pw[w] & ~mask) | ((uint32_t)s_charset[d] << shift);
+                break;
             }
+            dig[p] = 0;
+            const int w = d_pw_word[p];
+            const uint32_t shift = (uint32_t)d_pw_shift[p];
+            const uint32_t mask = 0xffu << shift;
+            ha1Pw[w] = (ha1Pw[w] & ~mask) | ((uint32_t)s_charset[0] << shift);
         }
     }
 }
@@ -695,6 +932,10 @@ int main(int argc, char **argv)
         respWords[rblk * 16 - 2] = (uint32_t)(bits & 0xffffffffULL);
         respWords[rblk * 16 - 1] = (uint32_t)(bits >> 32);
     }
+    uint32_t respRK[MAX_RESP_BLK * 64] = {0};
+    for (int b = 0; b < rblk; b++)
+        for (int i = 0; i < 64; i++)
+            respRK[b * 64 + i] = HOST_MD5_K[i] + respWords[b * 16 + md5_word_index(i)];
 
     // ---- GPU 決定(CHAP 版と同じ) ----
     int devCount = 0;
@@ -765,6 +1006,9 @@ int main(int argc, char **argv)
                 pwShift[i] = (off & 3) * 8;
             }
         }
+        uint32_t ha1RK[64];
+        for (int i = 0; i < 64; i++)
+            ha1RK[i] = HOST_MD5_K[i] + ha1base[md5_word_index(i)];
 
         uint64_t total = 1;
         bool ovf = false;
@@ -795,10 +1039,10 @@ int main(int argc, char **argv)
                               {
                 CUDA_CHECK(cudaSetDevice(dev));
                 CUDA_CHECK(cudaMemcpyToSymbol(d_charset, charset.data(), clen));
-                CUDA_CHECK(cudaMemcpyToSymbol(d_ha1_base, ha1base, sizeof(ha1base)));
+                CUDA_CHECK(cudaMemcpyToSymbol(d_ha1_RK, ha1RK, sizeof(ha1RK)));
                 CUDA_CHECK(cudaMemcpyToSymbol(d_pw_word, pwWord, sizeof(pwWord)));
                 CUDA_CHECK(cudaMemcpyToSymbol(d_pw_shift, pwShift, sizeof(pwShift)));
-                CUDA_CHECK(cudaMemcpyToSymbol(d_resp_words, respWords, sizeof(respWords)));
+                CUDA_CHECK(cudaMemcpyToSymbol(d_resp_RK, respRK, sizeof(respRK)));
 
                 int *d_found = nullptr;
                 unsigned char *d_result = nullptr;
